@@ -1,22 +1,23 @@
 # Running the JMessage Server
 
-The JMessage server is a Python Flask application. The TAs will run an instance for the whole class, but you can run
-a copy locally as well. To build the application, you will need python3.
+The JMessage server is a Python Flask application. The TAs will run an instance for the whole class, but you can run a copy locally as well. To build the application, you will need python3.
 
 ## Installing the necessary packages
 
 You will need `flask`, `sqlite3`, `passlib`, `datetime`. Install these using pip:
 
-```
-pip3 install flask sqlite3 passlib datetime
+```bash
+$ pip3 install -r requirements.txt # Recommended to use the requirement doc
+$ pip3 install flask sqlite3 passlib datetime # only if you used a very old version of python.
 ```
 
 ## Run the server
 
-You can run the server directly from the command line:
+You can run the server directly from the command line. 
+PS: Please ensured that your correctly configured the pip3 path and used matched python3 application. 
 
-```
-python3 jmessage_server.py
+```bash
+$ python3 jmessage_server.py
 ```
 
 By default the server will run on port 8080 using the Flask "Development" server. It will create a database file called 
