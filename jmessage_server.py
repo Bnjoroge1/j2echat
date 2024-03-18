@@ -203,13 +203,13 @@ def verifyUserPassword(conn, username, password):
     c = conn.cursor()
     c.execute("SELECT username, pwdhash FROM users WHERE username= ?", (username,))
     userList = c.fetchall()
-    if scrypt.verify(password, userList[0][1]):
+    if len(userList) == 0 or userList is None:
+        print('User name not found! you need to register first')
+    elif scrypt.verify(password, userList[0][1]):
         return True
     else:
         print('Password invalid!')
         return False
-
-    print(userList)
 
 
 def getPubKey(conn, username):
