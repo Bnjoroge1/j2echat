@@ -626,7 +626,7 @@ func main() {
 	apiKey = newAPIkey
 
 	// Geerate a fresh public key, then upload it to the server
-	globalPubKey, globalPrivKey, err := generatePublicKey()
+	globalPubKey, globalPrivKey, err = generatePublicKey()
 	_ = globalPrivKey // This suppresses a Golang "unused variable" error
 	if err != nil {
 		fmt.Println("Unable to generate public key, exiting.")
