@@ -526,6 +526,19 @@ def getMessages(username, apikey):
     if messages is None: return false_response, 401
     return messages, 200
 
+import sqlite3
+
+def enable_wal_mode(database_path):
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    # Fetch and print the current journal mode to verify
+    cursor.execute("PRAGMA journal_mode;")
+    journal_mode = cursor.fetchone()
+    print(f"Current journal mode: {journal_mode[0]}")
+    conn.close()
+
+# Example usage
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
@@ -570,6 +583,7 @@ if __name__ == '__main__':
     else:
         context = 'adhoc'  # default: self-signed
         print("Using TLS with self-signed certificates")
+    #enable_wal_mode(args.dbfile)
 
     # # Launch the Flask (development) server.
     # #app = create_app(foo)

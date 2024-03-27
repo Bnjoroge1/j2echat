@@ -3,9 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"hash/crc32"
+
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	
+	"encoding/base64"
 	b64 "encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +29,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/curve25519"
 	//"io/ioutil"
 	//"log"
 )
@@ -277,7 +287,7 @@ func registerUserWithServer(username string, password string) error {
 	}
 
 	if code != 200 {
-		return errors.New("Bad result code")
+		return errors.New("bad result code")
 	}
 
 	return nil
@@ -382,7 +392,7 @@ func doReadAndSendMessage(recipient string, messageBody string) error {
 		// Next, read in a multi-line message, ending when we get an empty line (\n)
 		fmt.Println("Enter message contents below. Finish the message with a period.")
 
-		for keepReading == true {
+		for keepReading {
 			input, err := reader.ReadString('\n')
 			if err != nil {
 				fmt.Println("An error occured while reading input. Please try again", err)
@@ -432,6 +442,10 @@ func registerPublicKeyWithServer(username string, pubKeyEncoded PubKeyStruct) er
 
 	return nil
 }
+//encoding helper
+func encodeBase64(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+ }
 
 //******************************
 // Cryptography functions
@@ -454,9 +468,27 @@ func decodePrivateSigningKey(privKey PrivKeyStruct) ecdsa.PrivateKey {
 
 // Sign a string using ECDSA
 func ECDSASign(message []byte, privKey PrivKeyStruct) []byte {
-	// TODO: IMPLEMENT
+	
+	privKeyBytes, err := base64.StdEncoding.DecodeString(privKey.SigSK)
+	if err != nil {
+		return nil
+	}
+	//parse the private key
+	var ecdsaPrivKey *ecdsa.PrivateKey
+	ecdsaPrivKey, err = x509.ParseECPrivateKey(privKeyBytes)
+	if err != nil {
+		return nil
+	}
+	//hash the message
+	hash := sha256.Sum256(message)
 
-	return nil
+	//sign the hash
+	sig, err := ecdsa.SignASN1(rand.Reader, ecdsaPrivKey, hash[:])
+	if err != nil {
+		return nil
+	}
+
+	return sig
 }
 
 // Encrypts a byte string under a (Base64-encoded) public string, and returns a
@@ -466,14 +498,78 @@ func decryptMessage(payload string, senderUsername string, senderPubKey *PubKeyS
 
 	return nil, nil
 }
+func decodeBase64(encoded string) ([]byte, error) {
+	result, err := b64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
 
 // Encrypts a byte string under a (Base64-encoded) public string, and returns a
 // byte slice as a result.
 func encryptMessage(message []byte, senderUsername string, pubkey *PubKeyStruct) []byte {
 	// TODO: IMPLEMENT
+	//Decode recepient public key
+	recipientPubKeyBytes, err := decodeBase64(pubkey.EncPK)
+	if err != nil {
+		return nil
+	}
+	// Generate a random 32-byte scalar
+	var c [32]byte
+	_, err = rand.Read(c[:])
+	if err != nil {
+		
+	    return nil
 
-	return nil
+	}
+	//Generate a random scalar c and compute epk = cp and ssk
+	ssk, err := curve25519.X25519(c[:], recipientPubKeyBytes)
+	if err != nil {
+		return nil
+	}
+	//compute hash
+	K := sha256.Sum256(ssk)
+	//encode C1
+	C1 := encodeBase64(c[:])
+
+	//generate C2 by constructing string M.
+	Mprime := fmt.Sprintf("%s%s", senderUsername, message)
+	checksum := crc32.ChecksumIEEE([]byte(Mprime))
+	MdoublePrime := fmt.Sprintf("%s%d", Mprime, checksum)
+
+	//encrypt M
+	nonce := make([]byte, chacha20.NonceSize)// initialized at zero
+	cipher, err := chacha20.NewUnauthenticatedCipher(K[:], nonce)
+	if err != nil {
+		return nil
+	}
+	encrypted := make([]byte, len(MdoublePrime))
+	cipher.XORKeyStream(encrypted, []byte(MdoublePrime))
+	//encode C2
+	C2 := encodeBase64(encrypted)
+	
+	
+	//generate signatures
+	sig := ECDSASign([]byte(C1+ C2), globalPrivKey)
+	
+	//encode the signature
+	encodedSig := base64.StdEncoding.EncodeToString(sig)
+	//create JSON structure
+	ciphertext := CiphertextStruct {
+		C1: C1,
+		C2: C2,
+		Sig: encodedSig,
+	}
+	payloadBytes, err := json.Marshal(ciphertext)
+	if err != nil {
+		return nil
+	}
+	return payloadBytes
+	
+	
 }
+
 
 // Decrypt a list of messages in place
 func decryptMessages(messageArray []MessageStruct) {
@@ -569,7 +665,51 @@ func generatePublicKey() (PubKeyStruct, PrivKeyStruct, error) {
 	var pubKey PubKeyStruct
 	var privKey PrivKeyStruct
 
-	// TODO: IMPLEMENT
+	//Generate an ECDSA private key for encryption
+	encPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return PubKeyStruct{}, PrivKeyStruct{}, err
+	}
+
+	//Generate an ECDSA private Key for the signature using P-256 curve.
+	sigPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return PubKeyStruct{}, PrivKeyStruct{}, err
+	}
+	//marshal the public keys to ASN.1 DER encoding
+	encPubKeyDER, err := x509.MarshalPKIXPublicKey(&encPrivateKey.PublicKey)
+	if err != nil {
+		return PubKeyStruct{}, PrivKeyStruct{}, err
+	}
+	sigPubKeyDER, err := x509.MarshalPKIXPublicKey(&sigPrivateKey.PublicKey)
+	if err != nil {
+		return PubKeyStruct{}, PrivKeyStruct{}, err
+
+	}
+	//encode the DER-encoded public keys to Base64.
+	encPubKeyBase64 := base64.StdEncoding.EncodeToString(encPubKeyDER)
+	sigPubKeyBase64 := base64.StdEncoding.EncodeToString(sigPubKeyDER)
+
+	//marshal the private keys to PKCS#8
+	encPrivKeyPKCS8, err := x509.MarshalPKCS8PrivateKey(encPrivateKey)
+	if err != nil {
+		return PubKeyStruct{}, PrivKeyStruct{}, err
+	}
+	sigPrivKeyPKCS8, err := x509.MarshalPKCS8PrivateKey(sigPrivateKey)
+
+	//encode the PKCs#8-encoded private keys to base64
+	encPrivKeyBase64 := base64.StdEncoding.EncodeToString(encPrivKeyPKCS8)
+	sigPrivKeyBase64 := base64.StdEncoding.EncodeToString(sigPrivKeyPKCS8)
+
+	pubKey = PubKeyStruct{
+		EncPK: encPubKeyBase64,
+		SigPK: sigPubKeyBase64,
+	}
+	privKey = PrivKeyStruct{
+		EncSK: encPrivKeyBase64,
+		SigSK: sigPrivKeyBase64,
+	}
+	
 
 	return pubKey, privKey, nil
 }
