@@ -1,7 +1,9 @@
-.venv
-venv
+.venv/
+venv/
 *db
+*db-wal
+*db-shm
 sqldb
 sqldb-wal
 sqldb-shm
-
+path_to_your_database.db
