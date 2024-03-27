@@ -1,3 +1,7 @@
 .venv
 /venv
 *db
+sqldb
+sqldb-wal
+sqldb-shm
+
