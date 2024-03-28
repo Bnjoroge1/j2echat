@@ -3,24 +3,26 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"hash/crc32"
-
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	
+	"encoding/asn1"
 	"encoding/base64"
 	b64 "encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/ioutil"
+	"log"
+	"math/big"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -96,6 +98,11 @@ type CiphertextStruct struct {
 	C2  string `json:"C2"`
 	Sig string `json:"Sig"`
 }
+// Signature represents an ECDSA signature, which consists of two big integers, R and S.
+type Signature struct {
+	R, S *big.Int
+ }
+ 
 
 // PrettyPrint to print struct in a readable way
 func PrettyPrint(i interface{}) string {
@@ -413,6 +420,28 @@ func doReadAndSendMessage(recipient string, messageBody string) error {
 	return sendMessageToServer(username, recipient, []byte(encryptedMessage), 0)
 }
 
+func sendReadReceipt(apikey, serverURL, receiptUsername string, originalMessageID int) error {
+	postURL := fmt.Sprintf("%s://%s/sendMessage/%s/%s", serverProtocol, serverDomainAndPort, username, apiKey)
+	readRceipt := MessageStruct{
+		From: username,
+		To: receiptUsername,
+		ReceiptID: originalMessageID,
+		Payload: "read",
+	}
+	//marshall the read receipt to json
+	body, err := json.Marshal(readRceipt)
+	if err != nil {
+		return  err
+	}
+	statusCode, _, err := doPostRequest(postURL, body)
+	if err != nil {
+		return err
+	}
+	if statusCode != 200 {
+		fmt.Println("bad result code", statusCode)
+	}
+	return nil
+}
 // Request a key from the server
 func getKeyFromServer(user_key string) {
 	geturl := serverProtocol + "://" + serverDomain + ":" + strconv.Itoa(serverPort) + "/lookupKey?" + user_key
@@ -453,15 +482,79 @@ func encodeBase64(data []byte) string {
 
 // Encrypts a file on disk into a new ciphertext file on disk, returns the HEX encoded key
 // and file hash, or an error.
-func encryptAttachment(plaintextFilePath string, ciphertextFilePath string) (string, string, error) {
-	// TODO: IMPLEMENT
-	return "", "", nil
-}
+ func encryptAttachment(plaintextFilePath string, ciphertextFilePath string) (string, string, error) {
+     // Generate a random 256-bit (32-byte) key for ChaCha20
+     key := make([]byte, 32)
+     if _, err := rand.Read(key); err != nil {
+         return "", "", fmt.Errorf("failed to generate random key: %v", err)
+     }
+ 
+     // Open the plaintext file
+     plaintextFile, err := os.Open(plaintextFilePath)
+     if err != nil {
+         return "", "", fmt.Errorf("failed to open plaintext file: %v", err)
+     }
+     defer plaintextFile.Close()
+ 
+     // Create the ciphertext file
+     ciphertextFile, err := os.Create(ciphertextFilePath)
+     if err != nil {
+         return "", "", fmt.Errorf("failed to create ciphertext file: %v", err)
+     }
+     defer ciphertextFile.Close()
+ 
+     // Initialize ChaCha20 cipher
+     cipher, err := chacha20.NewUnauthenticatedCipher(key, make([]byte, chacha20.NonceSize))
+     if err != nil {
+         return "", "", fmt.Errorf("failed to create cipher: %v", err)
+     }
+     // Encrypt the file
+     buf := make([]byte, 4096) // buffer size
+     for {
+         n, err := plaintextFile.Read(buf)
+         if err != nil && err != io.EOF {
+             return "", "", fmt.Errorf("failed to read plaintext file: %v", err)
+         }
+         if n == 0 {
+             break
+         }
+
+         cipher.XORKeyStream(buf[:n], buf[:n])
+
+         if _, err := ciphertextFile.Write(buf[:n]); err != nil {
+             return "", "", fmt.Errorf("failed to write to ciphertext file: %v", err)
+         }
+     }
+ 
+     // Compute the SHA-256 hash of the encrypted file
+     _, err = ciphertextFile.Seek(0, io.SeekStart) // Rewind the file pointer to the beginning
+     if err != nil {
+         return "", "", fmt.Errorf("failed to seek ciphertext file: %v", err)
+     }
+     hash := sha256.New()
+     if _, err := io.Copy(hash, ciphertextFile); err != nil {
+         return "", "", fmt.Errorf("failed to compute hash of encrypted file: %v", err)
+     }
+ 
+     // Return the key and hash in HEX encoding
+     return hex.EncodeToString(key), hex.EncodeToString(hash.Sum(nil)), nil
+ }
 
 func decodePrivateSigningKey(privKey PrivKeyStruct) ecdsa.PrivateKey {
 	var result ecdsa.PrivateKey
 
 	// TODO: IMPLEMENT
+	privKeyBytes, err := base64.StdEncoding.DecodeString(privKey.SigSK)
+	if err != nil {
+		log.Fatalf("Failed to decode private key: %v", err)
+	}
+
+	ecdsaPrivKey, err := x509.ParseECPrivateKey(privKeyBytes)
+	if err != nil {
+		log.Fatalf("Failed to parse EC private key: %v", err)
+	}
+
+	result = *ecdsaPrivKey
 
 	return result
 }
@@ -490,14 +583,228 @@ func ECDSASign(message []byte, privKey PrivKeyStruct) []byte {
 
 	return sig
 }
+// verifySignature verifies the ECDSA signature of the message using the sender's public key.
+// signature is the base64 encoded ASN.1 DER encoded ECDSA signature.
+// sigPK is the base64 encoded DER encoded public key.
+func verifySignature(message []byte, signature []byte, pubKey *ecdsa.PublicKey) (bool, error) {
+	// Compute the SHA-256 hash of the message
+	hashed := sha256.Sum256(message)
+ 
+	// Unmarshal the ASN.1 DER encoded signature
+	var sig Signature
+	_, err := asn1.Unmarshal(signature, &sig)
+	if err != nil {
+	    return false, err
+	}
+ 
+	// Verify the signature with the public key
+	isValid := ecdsa.Verify(pubKey, hashed[:], sig.R, sig.S)
+ 
+	return isValid, nil
+ }
+ 
+ //decrypts C1 using the recipient's private key to obtain the shared secret key K.
+// decryptC1 decrypts C1 using the recipient's private key to obtain the shared secret key K.
+func decryptC1(c1Bytes []byte, recipientPrivKey *PrivKeyStruct) ([]byte, error) {
+	// Decode the recipient's private key
+	privKeyBytes, err := base64.StdEncoding.DecodeString(recipientPrivKey.EncSK)
+	if err != nil {
+		return nil, err
+	}
 
+	// Convert the private key bytes to an *ecdsa.PrivateKey
+	privKey, err := x509.ParseECPrivateKey(privKeyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert ECDSA private key to curve25519 private key
+	curve25519PrivKey, err := curve25519.X25519(privKey.D.Bytes(), curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure c1 is exactly 32 bytes and perform scalar multiplication to get the shared secret
+	var c1 [32]byte
+	copy(c1[:], c1Bytes[:32])
+	sharedSecret, err := curve25519.X25519(curve25519PrivKey[:], c1[:])
+	if err != nil {
+		return nil, err
+	}
+
+	// Hash the shared secret to derive the key K
+	K := sha256.Sum256(sharedSecret)
+	return K[:], nil
+}
+ // decryptC2 decrypts C2 using the shared secret key K to obtain the plaintext message M'.
+func decryptC2(c2Bytes, K []byte) (string, string, error) {
+	// Decode C2 from BASE64
+	
+ 
+	// Initialize ChaCha20 cipher with K and a zero IV
+	cipher, err := chacha20.NewUnauthenticatedCipher(K, make([]byte, chacha20.NonceSize))
+	if err != nil {
+	    return "", "", err
+	}
+ 
+	// Decrypt C2
+	decrypted := make([]byte, len(c2Bytes))
+	cipher.XORKeyStream(decrypted, c2Bytes)
+ 
+	// Ensure there's enough data for username, separator, message, and CHECK
+	if len(decrypted) < 5 { // Minimum length to include all components
+	    return "", "", errors.New("decrypted message format invalid")
+	}
+	
+ 
+	// Find the last occurrence of 0x3A which separates M and CHECK
+	sepIndex := strings.LastIndex(string(decrypted[:len(decrypted)-4]), ":")
+	if sepIndex == -1 {
+	    return "", "", errors.New("separator not found in decrypted message")
+	}
+ 
+	// Extract username, M, and CHECK
+	usernameAndM := decrypted[:sepIndex]
+	CHECK := decrypted[len(decrypted)-4:]
+ 
+	// Compute CHECK'
+	computedCHECK := crc32.ChecksumIEEE(usernameAndM)
+ 
+	// Convert CHECK to uint32 for comparison
+	extractedCHECK := binary.BigEndian.Uint32(CHECK)
+ 
+	// Verify CHECK
+	if computedCHECK != extractedCHECK {
+	    return "", "", errors.New("checksum mismatch")
+	}
+ 
+	// Split username and M
+	parts := strings.SplitN(string(usernameAndM), ":", 2)
+	if len(parts) != 2 {
+	    return "", "", errors.New("failed to extract username and message")
+	}
+	username, M := parts[0], parts[1]
+ 
+	return username, M, nil
+ }
+ 
 // Encrypts a byte string under a (Base64-encoded) public string, and returns a
 // byte slice as a result.
 func decryptMessage(payload string, senderUsername string, senderPubKey *PubKeyStruct, recipientPrivKey *PrivKeyStruct) ([]byte, error) {
 	// TODO: IMPLEMENT
+	var decrypted CiphertextStruct
+	if err := json.Unmarshal([]byte(payload), &decrypted); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal json payload: %v", err)
+	}
+	c1bytes, err := decodeBase64(decrypted.C1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64: %v", err)
+	}
+	c2bytes, err := decodeBase64(decrypted.C2)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64: %v", err)
+	}
+	sigBytes, err := decodeBase64(decrypted.Sig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64: %v", err)
+	}
+	// Decode sigPK from BASE64
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(senderPubKey.SigPK)
+	if err != nil {
+	return nil, fmt.Errorf("failed to decode public key from base64: %v", err)
+	}
+	// Parse the public key
+	pubKey, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+	if err != nil {
+	return nil, fmt.Errorf("failed to parse public key: %v", err)
+	}
 
-	return nil, nil
+	ecdsaPubKey, ok := pubKey.(*ecdsa.PublicKey)
+	if !ok {
+	return nil, errors.New("public key is not of type ECDSA")
+	}
+	// Verify the signature
+	toVerify := append(c1bytes, c2bytes...)
+	if _, err := verifySignature(toVerify, sigBytes, ecdsaPubKey); err != nil {
+		return nil, fmt.Errorf("signature verification failed: %v", err)
+	}
+	//decode encSK
+	
+	//decode 
+
+	// Decrypt C1.
+	K, err := decryptC1(c1bytes, recipientPrivKey)
+	if err != nil {
+		return nil, err
+	}
+	// Decrypt C2
+	username, message, err := decryptC2(c2bytes, K)
+	if err != nil {
+		return nil, err
+	}
+	
+    // Verify the username
+    if username != senderUsername {
+	return nil, errors.New("sender username mismatch")
+    }
+ //return the message as a byte slice
+ return []byte(message), nil
 }
+
+ // Decrypts an attachment from a given URL, key, and hash, and saves it to a specified path.
+func decryptAttachment(url, keyHex, hashHex, savePath string) error {
+	// Convert the HEX encoded key and hash to bytes
+	key, err := hex.DecodeString(keyHex)
+	if err != nil {
+	    return fmt.Errorf("failed to decode key: %v", err)
+	}
+ 
+	expectedHash, err := hex.DecodeString(hashHex)
+	if err != nil {
+	    return fmt.Errorf("failed to decode hash: %v", err)
+	}
+ 
+	// Download the file
+	resp, err := http.Get(url)
+	if err != nil {
+	    return fmt.Errorf("failed to download file: %v", err)
+	}
+	defer resp.Body.Close()
+ 
+	encryptedData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+	    return fmt.Errorf("failed to read downloaded file: %v", err)
+	}
+ 
+	// Verify the hash of the encrypted file
+	actualHash := sha256.Sum256(encryptedData)
+	if !bytes.Equal(actualHash[:], expectedHash) {
+	    return errors.New("hash mismatch for downloaded file")
+	}
+ 
+	// Decrypt the file
+	cipher, err := chacha20.NewUnauthenticatedCipher(key, make([]byte, chacha20.NonceSize))
+	if err != nil {
+	    return fmt.Errorf("failed to create cipher: %v", err)
+	}
+ 
+	decryptedData := make([]byte, len(encryptedData))
+	cipher.XORKeyStream(decryptedData, encryptedData)
+ 
+	// Save the decrypted file
+	err = ioutil.WriteFile(savePath, decryptedData, 0644)
+	if err != nil {
+	    return fmt.Errorf("failed to save decrypted file: %v", err)
+	}
+ 
+	return nil
+ }
+      
+
+
+
+	
+
 func decodeBase64(encoded string) ([]byte, error) {
 	result, err := b64.StdEncoding.DecodeString(encoded)
 	if err != nil {
@@ -534,7 +841,7 @@ func encryptMessage(message []byte, senderUsername string, pubkey *PubKeyStruct)
 	C1 := encodeBase64(c[:])
 
 	//generate C2 by constructing string M.
-	Mprime := fmt.Sprintf("%s%s", senderUsername, message)
+	Mprime := fmt.Sprintf("%s:%s", senderUsername, message)
 	checksum := crc32.ChecksumIEEE([]byte(Mprime))
 	MdoublePrime := fmt.Sprintf("%s%d", Mprime, checksum)
 
@@ -570,11 +877,68 @@ func encryptMessage(message []byte, senderUsername string, pubkey *PubKeyStruct)
 	
 }
 
-
+// isAttachmentMessage checks if the decrypted message is an attachment message.
+func isAttachmentMessage(decryptedMessage string) bool {
+	return strings.HasPrefix(decryptedMessage, ">>>MSGURL=")
+ }
+ 
+ // parseAttachmentInfo extracts URL, KEY, and H from the attachment message.
+ func parseAttachmentInfo(decryptedMessage string) (string, string, string, error) {
+	parts := strings.Split(decryptedMessage, "?")
+	if len(parts) != 3 {
+	    return "", "", "", fmt.Errorf("invalid attachment message format")
+	}
+	url := strings.TrimPrefix(parts[0], ">>>MSGURL=")
+	key := strings.TrimPrefix(parts[1], "KEY=")
+	hash := strings.TrimPrefix(parts[2], "H=")
+	return url, key, hash, nil
+ }
+ 
+ // processAttachmentMessage processes an attachment message: downloads, decrypts the attachment, and notifies the user.
+ func processAttachmentMessage(decryptedMessage string) error {
+	url, key, hash, err := parseAttachmentInfo(decryptedMessage)
+	if err != nil {
+	    return fmt.Errorf("failed to parse attachment info: %v", err)
+	}
+ 
+	
+	savePath := "path/to/save/decrypted/file"
+ 
+	// Call decryptAttachment with the parsed information
+	err = decryptAttachment(url, key, hash, savePath)
+	if err != nil {
+	    return fmt.Errorf("failed to decrypt attachment: %v", err)
+	}
+ 
+	// Notify the user
+	fmt.Printf("Attachment has been received and written to disk at %s\n", savePath)
+	return nil
+ }
 // Decrypt a list of messages in place
 func decryptMessages(messageArray []MessageStruct) {
-	// TODO: IMPLEMENT
-}
+	for _, msg := range messageArray {
+	    ///handle any attachments in message
+	    decryptedMessage, err := decryptMessage(msg.Payload, msg.From, &globalPubKey, &globalPrivKey)
+	    if(isAttachmentMessage(string(decryptedMessage))){
+			err := processAttachmentMessage(string(decryptedMessage))
+			if err != nil {
+				fmt.Printf("Failed to process attachment message: %v\n", err)
+			}
+		}
+	    if err == nil {
+		   
+		   
+		   err := sendReadReceipt(apiKey, serverDomainAndPort, msg.From, msg.Id)
+		   if err != nil {
+			  fmt.Printf("Failed to send read receipt for message ID %d: %v\n", msg.Id, err)
+		   } else {
+			  fmt.Printf("Read receipt sent for message ID %d\n", msg.Id)
+		   }
+	    } else {
+		   fmt.Printf("Failed to decrypt message ID %d: %v\n", msg.Id, err)
+	    }
+	}
+ }
 
 // Download any attachments in a message list
 func downloadAttachments(messageArray []MessageStruct) {
